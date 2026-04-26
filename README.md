@@ -106,3 +106,8 @@ Signals:
 
 - `SIGINT` and `SIGTERM` are handled
 - signal exit status is `128 + signal`
+
+## TODO
+
+- Stream `startup-info` directly to the peer socket instead of
+  requiring it to fit in the fixed-size `to_lisp` buffer.

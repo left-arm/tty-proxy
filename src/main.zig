@@ -229,11 +229,7 @@ fn run() !RunOutcome {
             return .signaled;
         }
 
-        // In error mode, peer payload is treated as an error message and routed
-        // to stderr instead of stdout.
-        const error_mode = mode == .err;
-
-        const output_fd: posix.fd_t = if (error_mode)
+        const output_fd: posix.fd_t = if (mode == .err)
             posix.STDERR_FILENO
         else
             posix.STDOUT_FILENO;
@@ -361,6 +357,10 @@ fn run() !RunOutcome {
             }
         }
 
+        if ((!term_open and !to_lisp.canRead()) or mode == .err) {
+            _ = c.shutdown(lisp_stream.handle, c.SHUT_WR);
+        }
+
         if (term_out_ready) {
             // Drain buffered peer output to the selected terminal stream.
             const chunk = to_term.readSlice();
@@ -376,7 +376,7 @@ fn run() !RunOutcome {
 
         // Exit after peer EOF once buffered output has been fully written.
         if (!peer_open and !to_term.canRead()) {
-            return if (error_mode) .error_mode_complete else .connection_closed;
+            return if (mode == .err) .error_mode_complete else .connection_closed;
         }
     }
 }
