@@ -1,11 +1,10 @@
 const std = @import("std");
 const posix = std.posix;
 
-const c = @cImport({
-    @cInclude("sys/ioctl.h");
-    @cInclude("termios.h");
-    @cInclude("unistd.h");
-});
+const c = std.c;
+
+extern "c" fn tty_proxy_get_winsize(fd: c.fd_t, size: *c.winsize) c_int;
+extern "c" fn ttyname_r(fd: c.fd_t, buf: [*]u8, len: usize) c_int;
 
 // Resumable startup-plist encoder. No socket I/O or metadata-sized allocation
 // is performed here; encode() fills whatever space the readiness loop provides.
@@ -36,7 +35,7 @@ pub const StartupEncoder = struct {
     };
 
     args: []const [*:0]const u8,
-    env: []const [*:0]const u8,
+    env: []const ?[*:0]const u8,
     tty_buffer: [std.fs.max_path_bytes]u8 = undefined,
     tty_len: usize,
     size_buffer: [160]u8 = undefined,
@@ -50,32 +49,36 @@ pub const StartupEncoder = struct {
     env_value: []const u8 = "",
 
     // Capture fallible terminal metadata before any startup bytes are sent.
-    pub fn init(fd: posix.fd_t) !StartupEncoder {
+    pub fn init(
+        fd: c.fd_t,
+        args: []const [*:0]const u8,
+        env: []const ?[*:0]const u8,
+    ) !StartupEncoder {
         var tty_buffer: [std.fs.max_path_bytes]u8 = undefined;
         while (true) {
-            const rc = c.ttyname_r(fd, &tty_buffer, tty_buffer.len);
+            const rc = ttyname_r(fd, &tty_buffer, tty_buffer.len);
             if (rc == 0) break;
-            if (rc == @intFromEnum(posix.E.INTR)) continue;
-            return posix.unexpectedErrno(@enumFromInt(rc));
+            if (rc == @backingInt(c.E.INTR)) continue;
+            return posix.unexpectedErrno(@fromBackingInt(@intCast(rc)));
         }
 
-        var size = c.struct_winsize{};
+        var size = c.winsize{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
         while (true) {
-            const rc = c.ioctl(fd, c.TIOCGWINSZ, &size);
-            switch (posix.errno(rc)) {
+            const rc = tty_proxy_get_winsize(fd, &size);
+            switch (c.errno(rc)) {
                 .SUCCESS => break,
                 .INTR => continue,
                 else => |err| return posix.unexpectedErrno(err),
             }
         }
-        return initWithInfo(std.os.argv, std.os.environ, std.mem.sliceTo(&tty_buffer, 0), size);
+        return initWithInfo(args, env, std.mem.sliceTo(&tty_buffer, 0), size);
     }
 
     fn initWithInfo(
         args: []const [*:0]const u8,
-        env: []const [*:0]const u8,
+        env: []const ?[*:0]const u8,
         tty: []const u8,
-        size: c.struct_winsize,
+        size: c.winsize,
     ) !StartupEncoder {
         var encoder = StartupEncoder{
             .args = args,
@@ -88,7 +91,7 @@ pub const StartupEncoder = struct {
         const suffix = try std.fmt.bufPrint(
             &encoder.size_buffer,
             ") :size (:rows {} :cols {} :xpixels {} :ypixels {}))",
-            .{ size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel },
+            .{ size.row, size.col, size.xpixel, size.ypixel },
         );
         encoder.size_len = suffix.len;
         return encoder;
@@ -195,8 +198,9 @@ pub const StartupEncoder = struct {
                 },
                 .env_next => {
                     while (self.env_index < self.env.len) {
-                        const line = std.mem.sliceTo(self.env[self.env_index], 0);
+                        const entry = self.env[self.env_index];
                         self.env_index += 1;
+                        const line = std.mem.sliceTo(entry orelse continue, 0);
                         const equal = std.mem.indexOfScalar(u8, line, '=') orelse continue;
                         self.env_name = line[0..equal];
                         self.env_value = line[equal + 1 ..];
@@ -254,11 +258,11 @@ fn expectEncoded(
 test "startup encoder preserves wire format at every small chunk boundary" {
     const args = [_][*:0]const u8{ "tty-proxy", "", "a\"b\\c\n" };
     const env = [_][*:0]const u8{ "INVALID", "EMPTY=", "=unnamed", "A=a=b\"\\", "B=last" };
-    const size = c.struct_winsize{
-        .ws_row = 24,
-        .ws_col = 80,
-        .ws_xpixel = 640,
-        .ws_ypixel = 480,
+    const size = c.winsize{
+        .row = 24,
+        .col = 80,
+        .xpixel = 640,
+        .ypixel = 480,
     };
     const expected = "(:args (\"tty-proxy\" \"\" \"a\\\"b\\\\c\n\") :tty \"/dev/tty\\\"\\\\\"" ++
         " :env ((\"EMPTY\" \"\") (\"\" \"unnamed\") (\"A\" \"a=b\\\"\\\\\") (\"B\" \"last\"))" ++
@@ -269,8 +273,14 @@ test "startup encoder preserves wire format at every small chunk boundary" {
     }
 }
 
+test "startup encoder skips null environment entries" {
+    const env = [_]?[*:0]const u8{ null, "A=first", null, "B=last", null };
+    var encoder = try StartupEncoder.initWithInfo(&.{}, &env, "", .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 });
+    try expectEncoded(&encoder, "(:args () :tty \"\" :env ((\"A\" \"first\") (\"B\" \"last\")) :size (:rows 0 :cols 0 :xpixels 0 :ypixels 0))", 1);
+}
+
 test "startup encoder handles empty argument and environment lists" {
-    var encoder = try StartupEncoder.initWithInfo(&.{}, &.{}, "", .{});
+    var encoder = try StartupEncoder.initWithInfo(&.{}, &.{}, "", .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 });
     try expectEncoded(&encoder, "(:args () :tty \"\" :env () :size (:rows 0 :cols 0 :xpixels 0 :ypixels 0))", 1);
 }
 
@@ -280,7 +290,7 @@ test "startup encoder streams a string larger than the proxy buffer" {
     defer allocator.free(input);
     @memset(input, 'x');
     const args = [_][*:0]const u8{input.ptr};
-    var encoder = try StartupEncoder.initWithInfo(&args, &.{}, "/dev/tty", .{});
+    var encoder = try StartupEncoder.initWithInfo(&args, &.{}, "/dev/tty", .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 });
     const expected = try std.fmt.allocPrint(allocator, "(:args (\"{s}\") :tty \"/dev/tty\" :env () :size (:rows 0 :cols 0 :xpixels 0 :ypixels 0))", .{input});
     defer allocator.free(expected);
     try expectEncoded(&encoder, expected, 127);

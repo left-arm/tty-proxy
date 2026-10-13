@@ -4,11 +4,23 @@ Connects a Unix terminal to a local Common Lisp peer over a Unix socket.
 
 ## Build and configure
 
-Requires Zig 0.15.2 and a Unix-like system with `termios` and Unix sockets.
+Requires Zig 0.17.0 and a Unix-like system with `termios` and Unix sockets.
 
 ```sh
 zig build
 zig-out/bin/tty-proxy [args]
+```
+
+Build an optimized release binary:
+
+```sh
+zig build --release=fast
+```
+
+Run Zig unit tests:
+
+```sh
+zig build test
 ```
 
 Set `TTY_PROXY_CONFIG` to a config file, or use
@@ -27,7 +39,9 @@ only trusted peers and protected config/socket paths; never run elevated.
 
 ## Peer protocol
 
-Stdin must be a tty. The proxy sends a Lisp plist before interactive I/O:
+Stdin must be a tty, and stdout/stderr must be open (including in direct mode).
+A closed standard descriptor causes exit 1 before connecting to the peer.
+The proxy sends a Lisp plist before interactive I/O:
 
 ```lisp
 (:args ("tty-proxy" ...) :tty "/dev/tty..."
@@ -48,6 +62,12 @@ For `R`/`C`, use only the socket for interactive I/O. Reads and writes may be
 fragmented. Drain the full startup plist before reading terminal input, even
 if `R`/`C` arrives early. `E` cancels startup. On completion, flush output
 and close the socket write side.
+
+Input forwarding is byte-transparent. Read headroom and bounded draining batch
+already-available keyboard input to reduce avoidable sequence fragmentation,
+without waiting for future bytes. The proxy does not decode, validate, repair,
+or rearrange UTF-8 or Escape sequences. Sequence boundaries are best-effort,
+not guaranteed; the peer must handle fragmented reads.
 
 ### Direct mode (`D`, local sockets only)
 

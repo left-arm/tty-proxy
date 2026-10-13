@@ -10,19 +10,20 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = optimize != .debug,
+            .link_libc = true,
+            .single_threaded = true,
         }),
     });
-    exe.linkLibC();
+    exe.root_module.addCSourceFile(
+        .{ .file = b.path("src/compat.c"), .flags = &.{} },
+    );
 
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
+    run_cmd.addPassthruArgs();
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
     const run_step = b.step("run", "Run tty-proxy");
     run_step.dependOn(&run_cmd.step);
 
@@ -31,9 +32,13 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
+            .single_threaded = true,
         }),
     });
-    unit_tests.linkLibC();
+    unit_tests.root_module.addCSourceFile(
+        .{ .file = b.path("src/compat.c"), .flags = &.{} },
+    );
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

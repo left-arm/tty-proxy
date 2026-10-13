@@ -1,42 +1,54 @@
 const std = @import("std");
-const posix = std.posix;
-
 const Allocator = std.mem.Allocator;
 const CONFIG_ENV = "TTY_PROXY_CONFIG";
 
-// Resolves the Unix-socket target for the current executable name from the
-// runtime config file.
+const c = std.c;
+
+// Finds the socket path for this executable in the config file.
+// The caller must free the returned path with allocator.
 pub fn resolveSocket(
+    environ: std.process.Environ,
     allocator: Allocator,
     argv0: []const u8,
 ) ![]const u8 {
-    const path = try configPath(allocator);
+    const path = try configPath(environ, allocator);
     defer allocator.free(path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
+    defer allocator.free(path_z);
 
-    const source = try std.fs.cwd().readFileAllocOptions(
-        allocator,
-        path,
-        16 * 1024,
-        1024,
-        std.mem.Alignment.of(u8),
-        0,
-    );
+    const fd = c.open(path_z, .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return error.ConfigReadFailed;
+    defer _ = c.close(fd);
+
+    // Read one extra byte to distinguish an exactly-at-limit file from an
+    // oversized one without requiring file metadata (the path may be a FIFO).
+    const max_size = 16 * 1024;
+    const source = try allocator.alloc(u8, max_size + 1);
     defer allocator.free(source);
+    var count: usize = 0;
+    while (count < source.len) {
+        const rc = c.read(fd, source[count..].ptr, source.len - count);
+        if (rc < 0) {
+            if (c.errno(rc) == .INTR) continue;
+            return error.ConfigReadFailed;
+        }
+        if (rc == 0) break;
+        count += @intCast(rc);
+    }
+    if (count > max_size) return error.StreamTooLong;
 
-    return resolveSocketFromSource(allocator, argv0, source);
+    return findSocket(allocator, argv0, source[0..count]);
 }
 
 // Config lookup prefers an explicit override and otherwise falls back to the
 // standard per-user config location.
-fn configPath(allocator: Allocator) ![]const u8 {
-    if (posix.getenv(CONFIG_ENV)) |path| {
-        return allocator.dupe(u8, path);
-    }
+fn configPath(environ: std.process.Environ, allocator: Allocator) ![]const u8 {
+    if (environ.getPosix(CONFIG_ENV)) |path| return allocator.dupe(u8, path);
 
-    const home = posix.getenv("HOME") orelse
+    const home = environ.getPosix("HOME") orelse
         return error.EnvironmentVariableNotFound;
 
-    return try std.fs.path.join(
+    return std.fs.path.join(
         allocator,
         &.{ home, ".config/tty-proxy/config" },
     );
@@ -44,7 +56,7 @@ fn configPath(allocator: Allocator) ![]const u8 {
 
 // Parses the plain-text config and selects the best matching socket entry:
 // exact argv[0] first, then basename.
-fn resolveSocketFromSource(
+fn findSocket(
     allocator: Allocator,
     argv0: []const u8,
     source: []const u8,
@@ -96,13 +108,6 @@ fn parseSocketValue(value: []const u8) ?[]const u8 {
     return socket;
 }
 
-// Copies a parsed socket path into a caller-provided buffer.
-fn copySocketPath(socket_out: []u8, socket: []const u8) ![]const u8 {
-    if (socket.len > socket_out.len) return error.BufferTooSmall;
-    @memcpy(socket_out[0..socket.len], socket);
-    return socket_out[0..socket.len];
-}
-
 test "resolve socket prefers exact over basename and ignores command values" {
     const allocator = std.testing.allocator;
     const input =
@@ -113,7 +118,7 @@ test "resolve socket prefers exact over basename and ignores command values" {
         \\/usr/bin/tty-proxy = socket:/tmp/exact.sock
     ;
 
-    const exact = try resolveSocketFromSource(
+    const exact = try findSocket(
         allocator,
         "/usr/bin/tty-proxy",
         input,
@@ -121,7 +126,7 @@ test "resolve socket prefers exact over basename and ignores command values" {
     defer allocator.free(exact);
     try std.testing.expectEqualStrings("/tmp/exact.sock", exact);
 
-    const basename = try resolveSocketFromSource(
+    const basename = try findSocket(
         allocator,
         "/opt/bin/tty-proxy",
         input,
@@ -138,7 +143,7 @@ test "resolve socket reports missing when only command target exists" {
 
     try std.testing.expectError(
         error.NoPeerSocketConfigured,
-        resolveSocketFromSource(allocator, "tty-proxy", input),
+        findSocket(allocator, "tty-proxy", input),
     );
 }
 
@@ -152,6 +157,6 @@ test "resolve socket fails when allocator is too small" {
 
     try std.testing.expectError(
         error.OutOfMemory,
-        resolveSocketFromSource(allocator, "tty-proxy", input),
+        findSocket(allocator, "tty-proxy", input),
     );
 }

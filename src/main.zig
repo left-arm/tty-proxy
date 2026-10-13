@@ -1,18 +1,43 @@
 const std = @import("std");
 const posix = std.posix;
-const net = std.net;
 
 const config = @import("config.zig");
 const StartupEncoder = @import("startup.zig").StartupEncoder;
 
-const c = @cImport({
-    @cInclude("fcntl.h");
-    @cInclude("sys/select.h");
-    @cInclude("sys/ioctl.h");
-    @cInclude("signal.h");
-    @cInclude("termios.h");
-    @cInclude("unistd.h");
-});
+const c = std.c;
+
+extern "c" fn cfmakeraw(term: *c.termios) void;
+extern "c" fn tty_proxy_fd_zero(set: *anyopaque) void;
+extern "c" fn tty_proxy_fd_in_range(fd: c_int) c_int;
+extern "c" fn tty_proxy_fd_set(fd: c_int, set: *anyopaque) void;
+extern "c" fn tty_proxy_fd_isset(fd: c_int, set: *const anyopaque) c_int;
+extern "c" fn tty_proxy_pselect(
+    nfds: c_int,
+    readfds: *anyopaque,
+    writefds: *anyopaque,
+    exceptfds: *anyopaque,
+    timeout: ?*const c.timespec,
+    mask: *const c.sigset_t,
+) c_int;
+
+// compat.c checks that fd_set fits this storage and alignment.
+const FdSet = extern struct {
+    storage: [128]u8 align(8) = undefined,
+
+    fn init() FdSet {
+        var self = FdSet{};
+        tty_proxy_fd_zero(&self);
+        return self;
+    }
+
+    fn set(self: *FdSet, fd: c.fd_t) void {
+        tty_proxy_fd_set(fd, self);
+    }
+
+    fn isSet(self: *const FdSet, fd: c.fd_t) bool {
+        return tty_proxy_fd_isset(fd, self) != 0;
+    }
+};
 
 // Shared fixed-size buffer capacity used for both directions of the proxy.
 // Startup metadata is generated incrementally through the same outbound buffer.
@@ -26,6 +51,7 @@ const STDIN_READ_LIMIT: usize = 8;
 
 // Handlers only record cancellation. Signals are blocked outside pselect.
 var terminate_signal = std.atomic.Value(i32).init(0);
+
 var termination_count = std.atomic.Value(u32).init(0);
 var last_termination_signal = std.atomic.Value(i32).init(0);
 
@@ -65,7 +91,7 @@ const OperationMode = enum {
 
 // After D, the peer may send one unsigned status byte, then EOF.
 // EOF completes the session; an omitted status defaults to zero.
-// The proxy sends no payload. Its write-side EOF requests session cancellation.
+// No terminal input is forwarded in D mode. Write-side EOF requests detachment.
 const DirectSession = struct {
     status: ?u8 = null,
 
@@ -91,13 +117,30 @@ const Buffer = struct {
         return self.start < self.end;
     }
 
-    fn canWrite(self: *Buffer) bool {
-        return self.canWriteAtLeast(1);
+    fn ensureWriteSpace(self: *Buffer, minimum: usize) void {
+        std.debug.assert(minimum > 0 and minimum <= self.data.len);
+        // Avoid copying when even compaction cannot provide enough capacity.
+        if (self.data.len - self.end < minimum and
+            self.start > 0 and self.data.len - (self.end - self.start) >= minimum)
+        {
+            const remaining = self.end - self.start;
+            std.mem.copyForwards(
+                u8,
+                self.data[0..remaining],
+                self.data[self.start..self.end],
+            );
+            self.start = 0;
+            self.end = remaining;
+        }
     }
 
     fn canWriteAtLeast(self: *Buffer, minimum: usize) bool {
         self.ensureWriteSpace(minimum);
         return self.data.len - self.end >= minimum;
+    }
+
+    fn canWrite(self: *Buffer) bool {
+        return self.canWriteAtLeast(1);
     }
 
     fn writeSlice(self: *Buffer) []u8 {
@@ -120,26 +163,10 @@ const Buffer = struct {
             self.end = 0;
         }
     }
-
-    fn ensureWriteSpace(self: *Buffer, minimum: usize) void {
-        std.debug.assert(minimum > 0 and minimum <= self.data.len);
-        // Avoid copying when even compaction cannot provide enough capacity.
-        if (self.data.len - self.end < minimum and
-            self.start > 0 and self.data.len - (self.end - self.start) >= minimum)
-        {
-            const remaining = self.end - self.start;
-            std.mem.copyForwards(
-                u8,
-                self.data[0..remaining],
-                self.data[self.start..self.end],
-            );
-            self.start = 0;
-            self.end = remaining;
-        }
-    }
 };
 
-const StdinReadResult = struct {
+// Zero bytes does not mean EOF. A batch can read bytes and then reach EOF.
+const TerminalReadResult = struct {
     bytes: usize = 0,
     eof: bool = false,
 };
@@ -147,8 +174,8 @@ const StdinReadResult = struct {
 // Batch available terminal input before the next socket write. A short tty read
 // need not drain all available bytes; retrying can reduce proxy-induced gaps
 // between fragments of an already available key sequence.
-fn readTerminalInput(fd: posix.fd_t, buffer: *Buffer) !StdinReadResult {
-    var result = StdinReadResult{};
+fn readTerminalInput(fd: c.fd_t, buffer: *Buffer) !TerminalReadResult {
+    var result = TerminalReadResult{};
 
     for (0..STDIN_READ_LIMIT) |_| {
         if (!buffer.canWriteAtLeast(STDIN_READ_HEADROOM)) break;
@@ -163,7 +190,7 @@ fn readTerminalInput(fd: posix.fd_t, buffer: *Buffer) !StdinReadResult {
             const count: usize = @intCast(rc);
             buffer.produce(count);
             result.bytes += count;
-        } else switch (posix.errno(rc)) {
+        } else switch (c.errno(rc)) {
             .INTR, .AGAIN => break,
             else => |err| return posix.unexpectedErrno(err),
         }
@@ -172,13 +199,36 @@ fn readTerminalInput(fd: posix.fd_t, buffer: *Buffer) !StdinReadResult {
     return result;
 }
 
+fn getFdFlags(fd: c.fd_t) !c.O {
+    while (true) {
+        const rc = c.fcntl(fd, c.F.GETFL);
+        if (rc >= 0) return @bitCast(rc);
+        switch (c.errno(rc)) {
+            .BADF => return error.InvalidFileDescriptor,
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn setFdFlags(fd: c.fd_t, flags: c.O) !void {
+    while (true) {
+        const rc = c.fcntl(fd, c.F.SETFL, @as(c_int, @bitCast(flags)));
+        switch (c.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
 // Snapshot every descriptor before changing any flags: standard descriptors
 // may share an open-file description, so changing one can change the others.
 const StdioFlagsGuard = struct {
-    fds: [3]posix.fd_t,
-    original: [3]c_int,
+    fds: [3]c.fd_t,
+    original: [3]c.O,
 
-    fn capture(fds: [3]posix.fd_t) !StdioFlagsGuard {
+    fn capture(fds: [3]c.fd_t) !StdioFlagsGuard {
         var guard = StdioFlagsGuard{ .fds = fds, .original = undefined };
         for (fds, 0..) |fd, i| {
             guard.original[i] = try getFdFlags(fd);
@@ -187,8 +237,10 @@ const StdioFlagsGuard = struct {
     }
 
     fn enableNonBlocking(self: *const StdioFlagsGuard) !void {
-        for (self.fds, self.original) |fd, flags| {
-            try setFdFlags(fd, flags | c.O_NONBLOCK);
+        for (self.fds, self.original) |fd, original| {
+            var flags = original;
+            flags.NONBLOCK = true;
+            try setFdFlags(fd, flags);
         }
     }
 
@@ -202,15 +254,15 @@ const StdioFlagsGuard = struct {
 
 // Snapshot before startup; only R and D own final restoration.
 const TerminalGuard = struct {
-    fd: posix.fd_t,
+    fd: c.fd_t,
     original: c.termios,
 
-    fn capture(fd: posix.fd_t) !TerminalGuard {
-        var current: c.struct_termios = undefined;
+    fn capture(fd: c.fd_t) !TerminalGuard {
+        var current: c.termios = undefined;
 
         while (true) {
             const rc = c.tcgetattr(fd, &current);
-            switch (posix.errno(rc)) {
+            switch (c.errno(rc)) {
                 .SUCCESS => break,
                 .INTR => continue,
                 else => |err| return posix.unexpectedErrno(err),
@@ -223,11 +275,11 @@ const TerminalGuard = struct {
     fn enableRaw(self: *const TerminalGuard) !void {
         var current = self.original;
 
-        c.cfmakeraw(&current);
+        cfmakeraw(&current);
 
         while (true) {
-            const rc = c.tcsetattr(self.fd, c.TCSANOW, &current);
-            switch (posix.errno(rc)) {
+            const rc = c.tcsetattr(self.fd, c.TCSA.NOW, &current);
+            switch (c.errno(rc)) {
                 .SUCCESS => break,
                 .INTR => continue,
                 else => |err| return posix.unexpectedErrno(err),
@@ -236,9 +288,17 @@ const TerminalGuard = struct {
     }
 
     fn restore(self: *TerminalGuard) void {
+        // A shell may have reclaimed the foreground after suspending this
+        // job. Cleanup must not stop on SIGTTOU before restoring shared state.
+        var signals = posix.sigemptyset();
+        posix.sigaddset(&signals, c.SIG.TTOU);
+        var previous_mask: c.sigset_t = undefined;
+        if (c.sigprocmask(c.SIG.BLOCK, &signals, &previous_mask) < 0) return;
+        defer _ = c.sigprocmask(c.SIG.SETMASK, &previous_mask, null);
+
         while (true) {
-            const rc = c.tcsetattr(self.fd, c.TCSANOW, &self.original);
-            switch (posix.errno(rc)) {
+            const rc = c.tcsetattr(self.fd, c.TCSA.NOW, &self.original);
+            switch (c.errno(rc)) {
                 .SUCCESS => return,
                 .INTR => continue,
                 else => return,
@@ -247,25 +307,119 @@ const TerminalGuard = struct {
     }
 };
 
-pub fn main() void {
-    // Non-signal runtime failures are reported as a generic exit status 1.
-    const outcome = run() catch {
-        std.process.exit(1);
-    };
-
-    switch (outcome) {
-        .connection_closed => {},
-        .error_mode_complete => std.process.exit(1),
-        .signaled => |signal| std.process.exit(@intCast(128 + signal)),
-        .completed => |status| std.process.exit(status),
-    }
-}
-
 // Buffered terminal -> peer bytes.
 var to_lisp = Buffer{};
 
 // Buffered peer -> terminal bytes.
 var to_term = Buffer{};
+
+// Translates the peer's single-byte mode protocol into an enum used by the
+// rest of the runtime.
+fn parseMode(byte: u8) !OperationMode {
+    return switch (byte) {
+        'R' => .raw,
+        'C' => .canonical,
+        'E' => .err,
+        'D' => .direct,
+        else => return error.InvalidMode,
+    };
+}
+
+// Read the standard clock without the full process.Init runtime or threads.
+var clock_io: std.Io.Threaded = .init_single_threaded;
+
+fn monotonicNow() std.Io.Timestamp {
+    return std.Io.Clock.awake.now(clock_io.io());
+}
+
+fn connectUnixSocket(path: []const u8) !c.fd_t {
+    var address: c.sockaddr.un = std.mem.zeroes(c.sockaddr.un);
+    if (path.len >= address.path.len) return error.NameTooLong;
+    address.family = c.AF.UNIX;
+    @memcpy(address.path[0..path.len], path);
+    const address_len: c.socklen_t = @intCast(@offsetOf(c.sockaddr.un, "path") + path.len + 1);
+    if (@hasField(c.sockaddr.un, "len")) address.len = @intCast(address_len);
+
+    const fd = c.socket(c.AF.UNIX, c.SOCK.STREAM, 0);
+    if (fd < 0) return posix.unexpectedErrno(c.errno(fd));
+    errdefer _ = c.close(fd);
+    const rc = c.connect(fd, @ptrCast(&address), address_len);
+    if (rc != 0) return posix.unexpectedErrno(c.errno(rc));
+    return fd;
+}
+
+// All pumped I/O is driven from pselect(), so participating descriptors use
+// nonblocking mode. Direct mode leaves stdio flags unchanged.
+fn setNonBlocking(fd: c.fd_t) !void {
+    var flags = try getFdFlags(fd);
+    flags.NONBLOCK = true;
+    try setFdFlags(fd, flags);
+}
+
+fn closeWriteSide(fd: c.fd_t) !void {
+    while (true) {
+        const rc = c.shutdown(fd, 1);
+        switch (c.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+// Block the signals checked by the event loop, and return a mask that
+// temporarily unblocks them during pselect().
+fn blockTerminationSignals() !c.sigset_t {
+    var signals = posix.sigemptyset();
+    inline for (.{ c.SIG.INT, c.SIG.TERM, c.SIG.HUP }) |signal| {
+        posix.sigaddset(&signals, signal);
+    }
+
+    // Block these signals and save the previous mask in one call.
+    var wait_mask: c.sigset_t = undefined;
+    const rc = c.sigprocmask(c.SIG.BLOCK, &signals, &wait_mask);
+    if (rc < 0) return posix.unexpectedErrno(c.errno(rc));
+
+    inline for (.{ c.SIG.INT, c.SIG.TERM, c.SIG.HUP }) |signal| {
+        posix.sigdelset(&wait_mask, signal);
+    }
+
+    return wait_mask;
+}
+
+fn signalHandler(signal: c.SIG) callconv(.c) void {
+    const signal_int: i32 = @intCast(@backingInt(signal));
+    last_termination_signal.store(signal_int, .monotonic);
+    _ = termination_count.fetchAdd(1, .monotonic);
+    _ = terminate_signal.cmpxchgStrong(0, signal_int, .monotonic, .monotonic);
+}
+
+// Handlers record cancellation only; half-close and cleanup run in the loop.
+fn installSignalHandlers() void {
+    const action = c.Sigaction{
+        .handler = .{ .handler = signalHandler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+
+    posix.sigaction(c.SIG.INT, &action, null);
+    posix.sigaction(c.SIG.TERM, &action, null);
+    posix.sigaction(c.SIG.HUP, &action, null);
+
+    // Let write() report EPIPE instead of terminating the process, so the
+    // normal error path can run and restore terminal settings.
+    const ignore_pipe = c.Sigaction{
+        .handler = .{ .handler = @ptrFromInt(1) },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+
+    posix.sigaction(c.SIG.PIPE, &ignore_pipe, null);
+}
+
+fn isCancelled() bool {
+    return terminate_signal.load(.monotonic) != 0;
+}
 
 // Runtime contract: tty-proxy is expected to be launched by a user
 // from a shell in a terminal, with normal shell terminal settings.
@@ -274,43 +428,51 @@ var to_term = Buffer{};
 // VMIN=0) are out of scope. A zero-byte tty read is treated as EOF.
 //
 // Owns startup, the readiness loop, and shutdown/drain behavior.
-fn run() !RunOutcome {
+fn run(init: std.process.Init.Minimal) !RunOutcome {
     // Leave default signal actions active during potentially blocking startup.
     // No shared fd flags or terminal settings have been changed yet.
-    if (!posix.isatty(posix.STDIN_FILENO)) {
+    if (c.isatty(c.STDIN_FILENO) == 0) {
         return error.StdinIsNotATerminal;
     }
+
+    // Validate and snapshot stdio before opening config files or sockets.
+    // Otherwise a closed stdout/stderr could be reused as the peer socket,
+    // making terminal output feed back into the protocol instead of failing.
+    const stdio_flags = try StdioFlagsGuard.capture(.{
+        c.STDIN_FILENO,
+        c.STDOUT_FILENO,
+        c.STDERR_FILENO,
+    });
 
     const allocator = std.heap.c_allocator;
 
     const socket_path = try config.resolveSocket(
+        init.environ,
         allocator,
-        std.mem.sliceTo(std.os.argv[0], 0),
+        std.mem.sliceTo(init.args.vector[0], 0),
     );
+    defer allocator.free(socket_path);
 
-    var lisp_stream = try net.connectUnixSocket(socket_path);
-    defer lisp_stream.close();
+    const peer_fd = try connectUnixSocket(socket_path);
+    defer _ = c.close(peer_fd);
+    // Stdio uses fixed descriptors 0–2; only the peer needs a bounds check.
+    if (tty_proxy_fd_in_range(peer_fd) == 0) return error.FileDescriptorOutOfRange;
 
     // From here on, termination must run cleanup. Keep signals blocked except
     // during pselect() to avoid a race between checking the flag and sleeping.
     const wait_signal_mask = try blockTerminationSignals();
     installSignalHandlers();
 
-    const stdio_flags = try StdioFlagsGuard.capture(.{
-        posix.STDIN_FILENO,
-        posix.STDOUT_FILENO,
-        posix.STDERR_FILENO,
-    });
     var stdio_changed = false;
     defer if (stdio_changed) stdio_flags.restore();
 
-    var terminal = try TerminalGuard.capture(posix.STDIN_FILENO);
+    var terminal = try TerminalGuard.capture(c.STDIN_FILENO);
     var restore_terminal = false;
     defer if (restore_terminal) terminal.restore();
 
-    // D leaves stdio flags alone. Pumped modes enable nonblocking I/O
-    // after selection, with cleanup armed before changing any descriptor.
-    try setNonBlocking(lisp_stream.handle);
+    // Make the peer socket nonblocking now. Stdio changes only after R/C/E
+    // selection; D leaves its flags alone.
+    try setNonBlocking(peer_fd);
 
     // stdin EOF: stop reading terminal input
     var term_open = true;
@@ -319,31 +481,30 @@ fn run() !RunOutcome {
     var peer_open = true;
 
     // Capture terminal metadata now, then encode incrementally in the loop.
-    var startup = try StartupEncoder.init(posix.STDIN_FILENO);
+    var startup = try StartupEncoder.init(c.STDIN_FILENO, init.args.vector, init.environ.block.slice);
     var startup_complete = false;
 
     var mode: OperationMode = .none;
     var direct = DirectSession{};
-    var direct_timer: ?std.time.Timer = null;
-    var shutdown_deadline: ?u64 = null;
+    var shutdown_deadline: ?std.Io.Timestamp = null;
 
     while (true) {
         if (mode == .direct) {
             const cancellations = termination_count.load(.monotonic);
             if (cancellations > 0) {
-                const now = direct_timer.?.read();
                 if (shutdown_deadline == null) {
                     // EOF requests detachment of this session, not termination
                     // of the long-lived peer. Stop even an early D's startup.
-                    try shutdownWrite(lisp_stream.handle);
+                    try closeWriteSide(peer_fd);
                     to_lisp.consume(to_lisp.readSlice().len);
-                    shutdown_deadline = now + 2 * std.time.ns_per_s;
+                    shutdown_deadline = monotonicNow().addDuration(.fromSeconds(2));
                 }
-                if (cancellations > 1 or now >= shutdown_deadline.?) {
+                const now = monotonicNow();
+                if (cancellations > 1 or now.compare(.gte, shutdown_deadline.?)) {
                     return .{ .signaled = last_termination_signal.load(.monotonic) };
                 }
             }
-        } else if (terminationSignal()) {
+        } else if (isCancelled()) {
             return .{ .signaled = terminate_signal.load(.monotonic) };
         }
 
@@ -358,14 +519,14 @@ fn run() !RunOutcome {
             startup_complete = true;
         }
 
-        const output_fd: posix.fd_t = if (mode == .err)
-            posix.STDERR_FILENO
+        const output_fd: c.fd_t = if (mode == .err)
+            c.STDERR_FILENO
         else
-            posix.STDOUT_FILENO;
+            c.STDOUT_FILENO;
 
-        var read_fds = c.fd_set{};
-        var write_fds = c.fd_set{};
-        var except_fds = c.fd_set{};
+        var read_fds = FdSet.init();
+        var write_fds = FdSet.init();
+        var except_fds = FdSet.init();
 
         if (peer_open) {
             // Interactive input starts only after startup has fully drained
@@ -373,43 +534,43 @@ fn run() !RunOutcome {
             if (startup_complete and mode.canReadStdin() and term_open and
                 to_lisp.canWriteAtLeast(STDIN_READ_HEADROOM))
             {
-                c.FD_SET(posix.STDIN_FILENO, &read_fds);
-                c.FD_SET(posix.STDIN_FILENO, &except_fds);
+                read_fds.set(c.STDIN_FILENO);
+                except_fds.set(c.STDIN_FILENO);
             }
 
             // D uses the free to_term storage as a control-read scratch buffer;
             // other modes queue the bytes for stdout/stderr.
             if (to_term.canWrite()) {
-                c.FD_SET(lisp_stream.handle, &read_fds);
-                c.FD_SET(lisp_stream.handle, &except_fds);
+                read_fds.set(peer_fd);
+                except_fds.set(peer_fd);
             }
 
             // After the peer selects E mode, do not send any more buffered bytes back.
             if (mode.canWritePeer() and shutdown_deadline == null and to_lisp.canRead()) {
-                c.FD_SET(lisp_stream.handle, &write_fds);
-                c.FD_SET(lisp_stream.handle, &except_fds);
+                write_fds.set(peer_fd);
+                except_fds.set(peer_fd);
             }
         }
 
         if (to_term.canRead()) {
-            c.FD_SET(output_fd, &write_fds);
-            c.FD_SET(output_fd, &except_fds);
+            write_fds.set(output_fd);
+            except_fds.set(output_fd);
         }
 
         // Build readiness each iteration from current buffers/state, then wait
         // until one side can make progress.
         var timeout: c.timespec = undefined;
         const timeout_ptr: ?*const c.timespec = if (shutdown_deadline) |deadline| blk: {
-            const remaining = deadline -| direct_timer.?.read();
+            const remaining = @max(monotonicNow().durationTo(deadline).nanoseconds, 0);
             timeout = .{
-                .tv_sec = @intCast(remaining / std.time.ns_per_s),
-                .tv_nsec = @intCast(remaining % std.time.ns_per_s),
+                .sec = @intCast(remaining / std.time.ns_per_s),
+                .nsec = @intCast(remaining % std.time.ns_per_s),
             };
             break :blk &timeout;
         } else null;
 
-        const select_result = c.pselect(
-            lisp_stream.handle + 1,
+        const select_result = tty_proxy_pselect(
+            peer_fd + 1,
             &read_fds,
             &write_fds,
             &except_fds,
@@ -418,24 +579,23 @@ fn run() !RunOutcome {
         );
 
         if (select_result < 0) {
-            switch (posix.errno(select_result)) {
+            switch (c.errno(select_result)) {
                 .INTR => continue,
                 else => |err| return posix.unexpectedErrno(err),
             }
         }
 
         // Recompute readiness from the fd_sets returned by pselect().
-        const term_in_ready = c.FD_ISSET(posix.STDIN_FILENO, &read_fds) != 0 or
-            c.FD_ISSET(posix.STDIN_FILENO, &except_fds) != 0;
-        const lisp_in_ready = (c.FD_ISSET(lisp_stream.handle, &read_fds) != 0 or
-            c.FD_ISSET(lisp_stream.handle, &except_fds) != 0);
-        const lisp_out_ready = (c.FD_ISSET(lisp_stream.handle, &write_fds) != 0);
-        const term_out_ready = c.FD_ISSET(output_fd, &write_fds) != 0;
+        const term_in_ready = read_fds.isSet(c.STDIN_FILENO) or
+            except_fds.isSet(c.STDIN_FILENO);
+        const lisp_in_ready = read_fds.isSet(peer_fd) or except_fds.isSet(peer_fd);
+        const lisp_out_ready = write_fds.isSet(peer_fd);
+        const term_out_ready = write_fds.isSet(output_fd);
 
         var stdin_bytes_read: usize = 0;
 
         if (term_in_ready) {
-            const result = try readTerminalInput(posix.STDIN_FILENO, &to_lisp);
+            const result = try readTerminalInput(c.STDIN_FILENO, &to_lisp);
             stdin_bytes_read = result.bytes;
             if (result.eof) term_open = false;
         }
@@ -445,13 +605,13 @@ fn run() !RunOutcome {
             // remaining bytes are terminal payload or D's optional status.
             var lisp_slice = to_term.writeSlice();
             const read_rc = c.read(
-                lisp_stream.handle,
+                peer_fd,
                 lisp_slice.ptr,
                 lisp_slice.len,
             );
             if (read_rc == 0) {
                 if (mode == .direct) {
-                    return if (terminationSignal())
+                    return if (isCancelled())
                         .{ .signaled = terminate_signal.load(.monotonic) }
                     else
                         .{ .completed = direct.exitStatus() };
@@ -462,12 +622,10 @@ fn run() !RunOutcome {
 
                 if (mode == .none) {
                     // The first byte is control data, not payload.
-                    mode = try parseOperationModeByte(lisp_slice[0]);
+                    mode = try parseMode(lisp_slice[0]);
                     if (mode == .raw or mode == .direct) restore_terminal = true;
                     if (mode == .raw) try terminal.enableRaw();
-                    if (mode == .direct) {
-                        direct_timer = try std.time.Timer.start();
-                    } else {
+                    if (mode != .direct) {
                         stdio_changed = true;
                         try stdio_flags.enableNonBlocking();
                     }
@@ -487,7 +645,7 @@ fn run() !RunOutcome {
                 } else {
                     to_term.produce(count);
                 }
-            } else switch (posix.errno(read_rc)) {
+            } else switch (c.errno(read_rc)) {
                 .INTR, .AGAIN => {},
                 else => |err| return posix.unexpectedErrno(err),
             }
@@ -500,8 +658,8 @@ fn run() !RunOutcome {
             // A partial write/EAGAIN leaves bytes queued for write readiness.
             // Peer EOF or E mode observed above still prevents this write.
             const chunk = to_lisp.readSlice();
-            const write_rc = c.write(lisp_stream.handle, chunk.ptr, chunk.len);
-            if (write_rc < 0) switch (posix.errno(write_rc)) {
+            const write_rc = c.write(peer_fd, chunk.ptr, chunk.len);
+            if (write_rc < 0) switch (c.errno(write_rc)) {
                 .INTR, .AGAIN => {},
                 else => |err| return posix.unexpectedErrno(err),
             } else if (write_rc > 0) {
@@ -511,14 +669,14 @@ fn run() !RunOutcome {
         }
 
         if ((startup_complete and !term_open and !to_lisp.canRead()) or mode == .err) {
-            _ = c.shutdown(lisp_stream.handle, c.SHUT_WR);
+            _ = c.shutdown(peer_fd, 1);
         }
 
         if (term_out_ready) {
             // Drain buffered peer output to the selected terminal stream.
             const chunk = to_term.readSlice();
             const write_rc = c.write(output_fd, chunk.ptr, chunk.len);
-            if (write_rc < 0) switch (posix.errno(write_rc)) {
+            if (write_rc < 0) switch (c.errno(write_rc)) {
                 .INTR, .AGAIN => {},
                 else => |err| return posix.unexpectedErrno(err),
             } else if (write_rc > 0) {
@@ -534,119 +692,65 @@ fn run() !RunOutcome {
     }
 }
 
-// Translates the peer's single-byte mode protocol into an enum used by the
-// rest of the runtime.
-fn parseOperationModeByte(ch: u8) !OperationMode {
-    return switch (ch) {
-        'R' => .raw,
-        'C' => .canonical,
-        'E' => .err,
-        'D' => .direct,
-        else => return error.InvalidMode,
-    };
-}
-
-// All I/O is driven from pselect(), so every participating fd is switched to
-// non-blocking mode.
-fn setNonBlocking(fd: posix.fd_t) !void {
-    try setFdFlags(fd, (try getFdFlags(fd)) | c.O_NONBLOCK);
-}
-
-fn shutdownWrite(fd: posix.fd_t) !void {
-    while (true) {
-        const rc = c.shutdown(fd, c.SHUT_WR);
-        switch (posix.errno(rc)) {
-            .SUCCESS => return,
-            .INTR => continue,
-            else => |err| return posix.unexpectedErrno(err),
-        }
-    }
-}
-
-fn getFdFlags(fd: posix.fd_t) !c_int {
-    while (true) {
-        const rc = c.fcntl(fd, c.F_GETFL);
-        if (rc >= 0) return rc;
-        switch (posix.errno(rc)) {
-            .INTR => continue,
-            else => |err| return posix.unexpectedErrno(err),
-        }
-    }
-}
-
-fn setFdFlags(fd: posix.fd_t, flags: c_int) !void {
-    while (true) {
-        const rc = c.fcntl(fd, c.F_SETFL, flags);
-        switch (posix.errno(rc)) {
-            .SUCCESS => return,
-            .INTR => continue,
-            else => |err| return posix.unexpectedErrno(err),
-        }
-    }
-}
-
-// Block the signals checked by the event loop, and return a mask that
-// temporarily unblocks them during pselect().
-fn blockTerminationSignals() !c.sigset_t {
-    var termination_set: c.sigset_t = undefined;
-    if (c.sigemptyset(&termination_set) < 0) {
-        return posix.unexpectedErrno(posix.errno(-1));
-    }
-    inline for (.{ posix.SIG.INT, posix.SIG.TERM, posix.SIG.HUP }) |signal| {
-        if (c.sigaddset(&termination_set, @as(c_int, signal)) < 0) {
-            return posix.unexpectedErrno(posix.errno(-1));
-        }
-    }
-
-    if (c.sigprocmask(c.SIG_BLOCK, &termination_set, null) < 0) {
-        return posix.unexpectedErrno(posix.errno(-1));
-    }
-
-    var wait_mask: c.sigset_t = undefined;
-    if (c.sigprocmask(c.SIG_SETMASK, null, &wait_mask) < 0) {
-        return posix.unexpectedErrno(posix.errno(-1));
-    }
-
-    inline for (.{ posix.SIG.INT, posix.SIG.TERM, posix.SIG.HUP }) |signal| {
-        if (c.sigdelset(&wait_mask, @as(c_int, signal)) < 0) {
-            return posix.unexpectedErrno(posix.errno(-1));
-        }
-    }
-
-    return wait_mask;
-}
-
-// Handlers record cancellation only; half-close and cleanup run in the loop.
-fn installSignalHandlers() void {
-    const action = posix.Sigaction{
-        .handler = .{ .handler = signalHandler },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
+pub fn main(init: std.process.Init.Minimal) void {
+    // Non-signal runtime failures are reported as a generic exit status 1.
+    const outcome = run(init) catch {
+        std.process.exit(1);
     };
 
-    posix.sigaction(posix.SIG.INT, &action, null);
-    posix.sigaction(posix.SIG.TERM, &action, null);
-    posix.sigaction(posix.SIG.HUP, &action, null);
-
-    // Let write() report EPIPE instead of terminating the process, so the
-    // normal error path can run and restore terminal settings.
-    const ignore_pipe = posix.Sigaction{
-        .handler = .{ .handler = @ptrFromInt(1) },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-
-    posix.sigaction(posix.SIG.PIPE, &ignore_pipe, null);
+    switch (outcome) {
+        .connection_closed => {},
+        .error_mode_complete => std.process.exit(1),
+        .signaled => |signal| std.process.exit(@intCast(128 + signal)),
+        .completed => |status| std.process.exit(status),
+    }
 }
 
-fn signalHandler(signal: i32) callconv(.c) void {
-    last_termination_signal.store(signal, .monotonic);
-    _ = termination_count.fetchAdd(1, .monotonic);
-    _ = terminate_signal.cmpxchgStrong(0, signal, .monotonic, .monotonic);
+test "fd flags report invalid descriptors without unexpected errno diagnostics" {
+    try std.testing.expectError(error.InvalidFileDescriptor, getFdFlags(-1));
 }
 
-fn terminationSignal() bool {
-    return terminate_signal.load(.monotonic) != 0;
+test "terminal restoration preserves the signal mask on failure" {
+    var original: c.sigset_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.sigprocmask(c.SIG.SETMASK, null, &original));
+    defer _ = c.sigprocmask(c.SIG.SETMASK, &original, null);
+
+    for ([_]bool{ false, true }) |ttou_blocked| {
+        var expected = original;
+        posix.sigaddset(&expected, c.SIG.TERM);
+        if (ttou_blocked) {
+            posix.sigaddset(&expected, c.SIG.TTOU);
+        } else {
+            posix.sigdelset(&expected, c.SIG.TTOU);
+        }
+        try std.testing.expectEqual(@as(c_int, 0), c.sigprocmask(c.SIG.SETMASK, &expected, null));
+
+        var terminal = TerminalGuard{ .fd = -1, .original = std.mem.zeroes(c.termios) };
+        terminal.restore();
+
+        var actual: c.sigset_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), c.sigprocmask(c.SIG.SETMASK, null, &actual));
+        inline for (.{ c.SIG.INT, c.SIG.TERM, c.SIG.HUP, c.SIG.TTOU, c.SIG.PIPE }) |signal| {
+            try std.testing.expectEqual(posix.sigismember(&expected, signal), posix.sigismember(&actual, signal));
+        }
+    }
+}
+
+test "fd range validation rejects descriptors outside fd_set capacity" {
+    for ([_]c.fd_t{ c.STDIN_FILENO, c.STDOUT_FILENO, c.STDERR_FILENO }) |fd| {
+        try std.testing.expect(tty_proxy_fd_in_range(fd) != 0);
+    }
+    for ([_]c.fd_t{ -1, 1024, std.math.maxInt(c_int) }) |fd| {
+        try std.testing.expectEqual(@as(c_int, 0), tty_proxy_fd_in_range(fd));
+    }
+}
+
+test "fd sets track validated descriptors" {
+    var fds = FdSet.init();
+    try std.testing.expect(!fds.isSet(c.STDIN_FILENO));
+    fds.set(c.STDIN_FILENO);
+    try std.testing.expect(fds.isSet(c.STDIN_FILENO));
+    try std.testing.expect(!fds.isSet(c.STDOUT_FILENO));
 }
 
 test "buffer stdin headroom threshold" {
@@ -678,12 +782,24 @@ test "buffer waits for enough total headroom before compacting" {
     try std.testing.expectEqual(STDIN_READ_HEADROOM, buffer.writeSlice().len);
 }
 
+fn writeTest(fd: c.fd_t, bytes: []const u8) !usize {
+    const rc = c.write(fd, bytes.ptr, bytes.len);
+    if (rc < 0) return error.Unexpected;
+    return @intCast(rc);
+}
+
+fn makePipe() ![2]c.fd_t {
+    var fds: [2]c.fd_t = undefined;
+    if (c.pipe(&fds) != 0) return error.Unexpected;
+    return fds;
+}
+
 test "stdin reader preserves an available escape sequence near a buffer boundary" {
-    const pipe = try posix.pipe();
-    defer posix.close(pipe[0]);
-    defer posix.close(pipe[1]);
+    const pipe = try makePipe();
+    defer _ = c.close(pipe[0]);
+    defer _ = c.close(pipe[1]);
     try setNonBlocking(pipe[0]);
-    try std.testing.expectEqual(@as(usize, 3), try posix.write(pipe[1], "\x1b[A"));
+    try std.testing.expectEqual(@as(usize, 3), try writeTest(pipe[1], "\x1b[A"));
 
     var buffer = Buffer{ .start = STDIN_READ_HEADROOM, .end = BUFFER_SIZE - 1 };
     @memset(&buffer.data, 'p');
@@ -698,11 +814,11 @@ test "stdin reader preserves an available escape sequence near a buffer boundary
 }
 
 test "stdin reader pauses below headroom and resumes after draining" {
-    const pipe = try posix.pipe();
-    defer posix.close(pipe[0]);
-    defer posix.close(pipe[1]);
+    const pipe = try makePipe();
+    defer _ = c.close(pipe[0]);
+    defer _ = c.close(pipe[1]);
     try setNonBlocking(pipe[0]);
-    try std.testing.expectEqual(@as(usize, 3), try posix.write(pipe[1], "\x1b[A"));
+    try std.testing.expectEqual(@as(usize, 3), try writeTest(pipe[1], "\x1b[A"));
 
     var buffer = Buffer{ .end = BUFFER_SIZE - (STDIN_READ_HEADROOM - 1) };
     @memset(&buffer.data, 'p');
@@ -717,31 +833,33 @@ test "stdin reader pauses below headroom and resumes after draining" {
 }
 
 test "stdin reader does not wait for Escape continuation" {
-    const pipe = try posix.pipe();
-    defer posix.close(pipe[0]);
-    defer posix.close(pipe[1]);
+    const pipe = try makePipe();
+    defer _ = c.close(pipe[0]);
+    defer _ = c.close(pipe[1]);
     try setNonBlocking(pipe[0]);
     var buffer = Buffer{};
-    try std.testing.expectEqual(@as(usize, 1), try posix.write(pipe[1], "\x1b"));
+    try std.testing.expectEqual(@as(usize, 1), try writeTest(pipe[1], "\x1b"));
     const first = try readTerminalInput(pipe[0], &buffer);
     try std.testing.expectEqual(@as(usize, 1), first.bytes);
     try std.testing.expect(!first.eof);
     try std.testing.expectEqualStrings("\x1b", buffer.readSlice());
 
-    try std.testing.expectEqual(@as(usize, 2), try posix.write(pipe[1], "[A"));
+    try std.testing.expectEqual(@as(usize, 2), try writeTest(pipe[1], "[A"));
     const rest = try readTerminalInput(pipe[0], &buffer);
     try std.testing.expectEqual(@as(usize, 2), rest.bytes);
     try std.testing.expectEqualStrings("\x1b[A", buffer.readSlice());
 }
 
 test "stdin reader retains bytes read before EOF" {
-    const pipe = try posix.pipe();
-    defer posix.close(pipe[0]);
+    const pipe = try makePipe();
+    defer _ = c.close(pipe[0]);
     var writer_open = true;
-    defer if (writer_open) posix.close(pipe[1]);
+    defer {
+        if (writer_open) _ = c.close(pipe[1]);
+    }
     try setNonBlocking(pipe[0]);
-    try std.testing.expectEqual(@as(usize, 3), try posix.write(pipe[1], "\x1b[A"));
-    posix.close(pipe[1]);
+    try std.testing.expectEqual(@as(usize, 3), try writeTest(pipe[1], "\x1b[A"));
+    _ = c.close(pipe[1]);
     writer_open = false;
 
     var buffer = Buffer{};
@@ -753,13 +871,13 @@ test "stdin reader retains bytes read before EOF" {
 
 test "stdio flags guard restores shared descriptors and existing nonblocking flags" {
     for ([_]bool{ false, true }) |initially_nonblocking| {
-        const pipe = try posix.pipe();
-        defer posix.close(pipe[0]);
-        defer posix.close(pipe[1]);
-        const alias1 = try posix.dup(pipe[0]);
-        defer posix.close(alias1);
-        const alias2 = try posix.dup(pipe[0]);
-        defer posix.close(alias2);
+        const pipe = try makePipe();
+        defer _ = c.close(pipe[0]);
+        defer _ = c.close(pipe[1]);
+        const alias1 = c.dup(pipe[0]);
+        defer _ = c.close(alias1);
+        const alias2 = c.dup(pipe[0]);
+        defer _ = c.close(alias2);
 
         if (initially_nonblocking) try setNonBlocking(pipe[0]);
         const original = try getFdFlags(pipe[0]);
@@ -768,7 +886,7 @@ test "stdio flags guard restores shared descriptors and existing nonblocking fla
             defer guard.restore();
             try guard.enableNonBlocking();
             for (guard.fds) |fd| {
-                try std.testing.expect((try getFdFlags(fd)) & c.O_NONBLOCK != 0);
+                try std.testing.expect((try getFdFlags(fd)).NONBLOCK);
             }
         }
         for (guard.fds) |fd| {
@@ -778,12 +896,12 @@ test "stdio flags guard restores shared descriptors and existing nonblocking fla
 }
 
 test "stdio flags guard restores independent descriptors" {
-    const pipe1 = try posix.pipe();
-    defer posix.close(pipe1[0]);
-    defer posix.close(pipe1[1]);
-    const pipe2 = try posix.pipe();
-    defer posix.close(pipe2[0]);
-    defer posix.close(pipe2[1]);
+    const pipe1 = try makePipe();
+    defer _ = c.close(pipe1[0]);
+    defer _ = c.close(pipe1[1]);
+    const pipe2 = try makePipe();
+    defer _ = c.close(pipe2[0]);
+    defer _ = c.close(pipe2[1]);
     try setNonBlocking(pipe2[0]);
 
     const guard = try StdioFlagsGuard.capture(.{ pipe1[0], pipe1[1], pipe2[0] });
@@ -791,7 +909,7 @@ test "stdio flags guard restores independent descriptors" {
         defer guard.restore();
         try guard.enableNonBlocking();
         for (guard.fds) |fd| {
-            try std.testing.expect((try getFdFlags(fd)) & c.O_NONBLOCK != 0);
+            try std.testing.expect((try getFdFlags(fd)).NONBLOCK);
         }
     }
     for (guard.fds, guard.original) |fd, original| {
@@ -836,10 +954,10 @@ test "reject extra status bytes across arbitrary read boundaries" {
 test "operation mode parser accepts R C E D" {
     const testing = std.testing;
 
-    try testing.expectEqual(OperationMode.raw, try parseOperationModeByte('R'));
-    try testing.expectEqual(OperationMode.canonical, try parseOperationModeByte('C'));
-    try testing.expectEqual(OperationMode.err, try parseOperationModeByte('E'));
-    try testing.expectEqual(OperationMode.direct, try parseOperationModeByte('D'));
-    try testing.expectError(error.InvalidMode, parseOperationModeByte(' '));
-    try testing.expectError(error.InvalidMode, parseOperationModeByte('x'));
+    try testing.expectEqual(OperationMode.raw, try parseMode('R'));
+    try testing.expectEqual(OperationMode.canonical, try parseMode('C'));
+    try testing.expectEqual(OperationMode.err, try parseMode('E'));
+    try testing.expectEqual(OperationMode.direct, try parseMode('D'));
+    try testing.expectError(error.InvalidMode, parseMode(' '));
+    try testing.expectError(error.InvalidMode, parseMode('x'));
 }
